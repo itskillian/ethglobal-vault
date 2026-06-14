@@ -345,6 +345,16 @@ contract VaultHook is BaseHook, Ownable {
             if (upper <= lower) upper = lower + spacing;
             ranges[j] = Range(lower, upper);
         }
+
+        // Enforce nesting by index: with ascending confidences each band must contain the previous
+        // (tighter) one. The raw crossings are already nested, but the per-band degenerate-widen
+        // above can push a collapsed inner band's upper one spacing past an equal-width outer band,
+        // breaking containment. Grow each band outward to cover its predecessor so ranges[j-1] ⊆
+        // ranges[j] always holds. (No-op when no band collapsed, so dense distributions are unchanged.)
+        for (uint256 j = 1; j < n; j++) {
+            if (ranges[j].tickLower > ranges[j - 1].tickLower) ranges[j].tickLower = ranges[j - 1].tickLower;
+            if (ranges[j].tickUpper < ranges[j - 1].tickUpper) ranges[j].tickUpper = ranges[j - 1].tickUpper;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -376,10 +386,10 @@ contract VaultHook is BaseHook, Ownable {
         P.rebaseInterval = interval;
     }
 
-    /// @notice Set the per-pool prune aggressiveness (owner). On rebase, ticks holding less than
-    ///         `total / fraction` are dropped. A larger `fraction` prunes less; `0` disables pruning
-    ///         entirely. Non-zero values must be ≥ {MIN_PRUNE_FRACTION} so a fat-finger can't set a
-    ///         dust threshold large enough to clip a live percentile band.
+    /// @notice Set the per-pool prune aggressiveness (owner). On rebase, up to `total / fraction` of
+    ///         cumulative weight is trimmed from each tail (never interior ticks). A larger `fraction`
+    ///         prunes less; `0` disables tail pruning entirely. Non-zero values must be ≥
+    ///         {MIN_PRUNE_FRACTION} so a fat-finger can't set a tail budget that reaches a live band.
     function setPruneFraction(PoolId id, uint256 fraction) external onlyOwner {
         PoolDist storage P = pools[id];
         if (!P.initialized) revert NotInitialized();
@@ -388,9 +398,10 @@ contract VaultHook is BaseHook, Ownable {
     }
 
     /// @dev Divide every weight by the current growth factor `R` and reset the epoch — this changes
-    ///      no ratios, so the percentile bands are identical pre/post. Then prune ticks that have
-    ///      decayed to negligible (< total / pruneFraction) and re-tighten the scan bounds to the
-    ///      survivors, so reads only walk the live band. Integer-division rounding is sub-wei.
+    ///      no ratios, so the percentile bands are identical pre/post. Then prune the negligible
+    ///      tails (up to total / pruneFraction of cumulative weight from each end, never interior
+    ///      ticks) and re-tighten the scan bounds to the survivors, so reads only walk the live
+    ///      band without ever clipping it. Integer-division rounding is sub-wei.
     function _rebase(PoolDist storage P) internal returns (uint256 R) {
         R = _growthFactor(P);
         int16 minWord = _wordPos(P.minTick);
@@ -411,20 +422,37 @@ contract VaultHook is BaseHook, Ownable {
             if (word == maxWord) break;
         }
 
-        // Pass 2: prune negligible (decayed) ticks and re-tighten [minTick, maxTick] to the survivors.
-        // pruneFraction == 0 disables pruning (dust = 0 still drops any tick that rounded to zero weight).
+        // Pass 2: prune the negligible tails and re-tighten the scan bounds (own frame: keeps the
+        // legacy, non-via-ir stack from overflowing).
+        _pruneTails(P, minWord, maxWord, newTotal);
+        P.t0 = uint32(block.timestamp); // g back to 1
+    }
+
+    /// @dev Prune the negligible (decayed) TAILS of the distribution and re-tighten [minTick,
+    ///      maxTick] to the survivors. Pruning trims at most `dust` of CUMULATIVE weight from each
+    ///      END — never an interior tick — so a live confidence band is never clipped: a tick's own
+    ///      weight is irrelevant, only its position in the cumulative tail matters. The bound is
+    ///      strict (`< dust`) so even the most aggressive setting cannot reach the tightest band's
+    ///      tail mass. Dead (rounded-to-zero) ticks are always swept. pruneFraction == 0 disables
+    ///      tail pruning (dust == 0 then drops only zero-weight ticks).
+    function _pruneTails(PoolDist storage P, int16 minWord, int16 maxWord, uint256 newTotal) internal {
         uint256 pf = P.pruneFraction; // cache: read once instead of twice across the ternary
         uint256 dust = pf == 0 ? 0 : newTotal / pf;
         int24 newMin = type(int24).max;
         int24 newMax = type(int24).min;
         bool any;
+        uint256 cum; // running cumulative weight, low → high, over ALL ticks (pruned or not)
         for (int16 word = minWord;; word++) {
             uint256 bits = P.bitmap[word];
             uint256 clear; // bits to drop from this word; coalesced into one RMW after the inner loop
             while (bits != 0) {
                 uint8 lsb = BitMath.leastSignificantBit(bits);
                 int24 c = int24(word) * 256 + int24(uint24(lsb));
-                if (P.weight[c] <= dust) {
+                uint256 w = P.weight[c];
+                // Drop iff dead, or inside the bottom tail (cumulative-from-low, cum + w, < dust), or
+                // inside the top tail (cumulative-from-high, newTotal - cum, < dust). `cum` here is
+                // still the mass strictly below this tick.
+                if (w == 0 || cum + w < dust || newTotal - cum < dust) {
                     clear |= uint256(1) << lsb; // defer the drop (clears are commutative)
                     delete P.weight[c]; // free the slot (gas refund)
                 } else {
@@ -432,6 +460,7 @@ contract VaultHook is BaseHook, Ownable {
                     if (c > newMax) newMax = c;
                     any = true;
                 }
+                cum += w;
                 bits &= bits - 1;
             }
             // Apply all of this word's drops at once: one SLOAD+SSTORE per word, not per pruned bit.
@@ -442,7 +471,6 @@ contract VaultHook is BaseHook, Ownable {
             P.minTick = newMin;
             P.maxTick = newMax;
         }
-        P.t0 = uint32(block.timestamp); // g back to 1
     }
 
     // -------------------------------------------------------------------------

@@ -417,4 +417,77 @@ contract VaultHookTest is Test, Deployers {
         // weight should be on the order of the swap size, far above the WAD a count would add.
         assertGt(hook.weightAt(id_, tick), 2e18, "volume weight scales with swap size");
     }
+
+    // --- regression: H1 (band nesting) & H2 (prune never clips a live band) ------
+
+    /// @dev H1: a concentrated, asymmetric distribution collapses the tight 90% band to a single
+    ///      tick at the top of the range. The per-band degenerate-widen (`upper = lower + spacing`)
+    ///      used to push that band's upper one spacing past the wider 99% band's upper, breaking the
+    ///      90 ⊆ 99 ⊆ 99.9 nesting the vault deploys as three LP positions. Bands must stay nested.
+    function test_computeRanges_bandsAlwaysNested_concentrated() public {
+        hook.setConfig(id_, 30 days, 0, 1e18); // low minData so a sparse distribution still computes
+        hook.setCaptureWindow(id_, -12000, 12000);
+
+        // A thin minority tick far below (defines the wider bands' lower tail) ...
+        swap(key_, true, -3e18, ZERO_BYTES); // zeroForOne: price down to a far-negative tick
+        // ... then drive back up and pile the overwhelming majority of weight onto one tick near the
+        // top, so the 90% band collapses to it.
+        swap(key_, false, -3e18, ZERO_BYTES); // back up toward/above peg
+        int24 dom = _currentTick();
+        for (uint256 i; i < 60; i++) {
+            // tiny round-trips that stay within one compressed bucket -> concentrate on `dom`
+            swap(key_, true, -2e14, ZERO_BYTES);
+            swap(key_, false, -2e14, ZERO_BYTES);
+        }
+        emit log_named_int("dominant tick", dom);
+
+        (VaultHook.Range[] memory r, bool ok) = hook.computeRanges(id_, CONF);
+        assertTrue(ok, "enough data");
+        for (uint256 j = 1; j < 3; j++) {
+            assertLe(r[j].tickLower, r[j - 1].tickLower, "outer band lower <= inner band lower");
+            assertGe(r[j].tickUpper, r[j - 1].tickUpper, "outer band upper >= inner band upper");
+        }
+    }
+
+    /// @dev H2: pruning must trim only the cumulative dust TAILS, never interior ticks of a live
+    ///      band. Build a heavy core plus a thin skirt of single-weight ticks that, although each is
+    ///      individually below the dust threshold (total/pruneFraction), cumulatively form the 99.9%
+    ///      band's lower tail. The old per-tick test deleted the whole skirt and collapsed the band
+    ///      toward the core; the cumulative-tail prune keeps the in-band skirt ticks.
+    function test_poke_doesNotClipLiveBandInterior() public {
+        hook.setCaptureWindow(id_, -12000, 12000);
+        hook.setPruneFraction(id_, 2000); // most aggressive allowed: dust = total/2000
+
+        // Heavy core near the peg (~2000 count-weight). No warps, so a later rebase has R≈1 and
+        // weights are preserved exactly — isolating the prune behaviour from decay flooring. With
+        // total ≈ 2000 and pruneFraction = 2000, dust ≈ 1 unit, so every single-weight skirt tick is
+        // individually at/below dust — yet cumulatively they form the live 99.9% lower tail.
+        for (uint256 i; i < 2000; i++) {
+            swap(key_, i % 2 == 0, -1e14, ZERO_BYTES);
+        }
+        // Thin skirt: five single-weight ticks stepping down below the core. skirt[0] is closest to
+        // the core (highest cumulative → deepest inside the band); skirt[4] is the deepest (the one
+        // genuine sub-threshold dust tick).
+        int24[5] memory skirt;
+        for (uint256 i; i < 5; i++) {
+            swap(key_, true, -2e18, ZERO_BYTES);
+            skirt[i] = _currentTick();
+        }
+
+        (VaultHook.Range[] memory before, bool okBefore) = hook.computeRanges(id_, CONF);
+        assertTrue(okBefore, "enough data before");
+        assertLe(before[2].tickLower, skirt[1], "99.9% band reaches into the skirt before prune");
+
+        hook.rebase(id_); // R≈1: renormalise (no-op) then prune
+
+        (VaultHook.Range[] memory afterRebase, bool okAfter) = hook.computeRanges(id_, CONF);
+        assertTrue(okAfter, "still ok after rebase");
+        // The skirt ticks well inside the band must survive — the buggy per-tick rule deleted every
+        // one of them (each holds ≤ dust) and collapsed the 99.9% band toward the core.
+        assertGt(hook.weightAt(id_, skirt[0]), 0, "innermost skirt tick clipped by prune");
+        assertGt(hook.weightAt(id_, skirt[1]), 0, "skirt tick clipped by prune");
+        assertGt(hook.weightAt(id_, skirt[2]), 0, "skirt tick clipped by prune");
+        // ...and the band itself must still reach down into the skirt, not collapse toward the core.
+        assertLe(afterRebase[2].tickLower, skirt[0], "99.9% band collapsed toward the core");
+    }
 }
