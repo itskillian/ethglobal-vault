@@ -147,6 +147,14 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @dev USDC dust (+ optional buffer), tracked internally — NEVER token.balanceOf (§5).
     uint256 public idleUSDC;
+    /// @dev USDT held outside positions, tracked internally (delta-credited, donation-proof). Valued in NAV
+    ///      at the clamped price. Fixes the residual leak where deploy slippage/dust escaped NAV (C3).
+    uint256 public idleUSDT;
+
+    /// @dev Pool-sqrt bounds of the peg band. NAV valuation clamps the spot price into [low, high] so an
+    ///      in-block spot push cannot move NAV beyond the band (C2). Recomputed on setPegBand.
+    uint160 internal navSqrtLow;
+    uint160 internal navSqrtHigh;
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Events / errors
@@ -170,6 +178,7 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     error SwapPoolIsVaultPool();
     error VanillaEntrypointDisabled();
     error AmountTooLarge();
+    error OffPeg();
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Constructor (§11)
@@ -223,6 +232,8 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         bufferBps = 0;
         swapMaxSlippageBps = 30;
         rebalanceGasCap = 350_000;
+
+        _recomputeNavSqrtBounds(); // C2: derive the NAV price-clamp band from pegLow/pegHigh
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -235,15 +246,16 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice NAV in USDC (6dp) (§5): Σ position (principal@spot + uncollected fees) + idleUSDC.
-     *         Computed from liquidity + recorded feeGrowth + idleUSDC ONLY — never token.balanceOf,
-     *         making raw token donations inert.
+     * @notice NAV in USDC (6dp) (§5): Σ position (principal + uncollected fees) + idleUSDC + idleUSDT·P.
+     *         Computed from liquidity + recorded feeGrowth + idle counters ONLY — never token.balanceOf,
+     *         making raw token donations inert. The USDT leg is valued at the spot price CLAMPED into the
+     *         peg band (`_navSqrt`), so an in-block spot manipulation cannot skew NAV beyond the band (C2).
      */
     function totalAssets() public view override returns (uint256 nav) {
-        uint160 sqrtP = _sqrtPriceX96();
-        nav = idleUSDC;
+        uint160 navSqrt = _navSqrt();
+        nav = idleUSDC + _usdtToUsdc(idleUSDT, navSqrt);
         for (uint8 i = 0; i < 4; i++) {
-            nav += _positionValueUSDC(i, sqrtP);
+            nav += _positionValueUSDC(i, navSqrt);
         }
     }
 
@@ -283,6 +295,9 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         if (paused) revert IsPaused();
         if (block.timestamp > deadline) revert Expired();
         if (usdcAmount == 0) revert ZeroAmount();
+        // C2: refuse to price shares while the vault pool spot is off peg (manipulated or genuinely
+        // depegged). Blocks the mint-cheap half of the NAV-manipulation attack; deposits can wait.
+        if (!_pegOk(_sqrtPriceX96())) revert OffPeg();
 
         // Pull USDC and measure ACTUAL received (defensive; §13). NAV ignores balanceOf, so totalAssets()
         // is still the pre-deposit value here — shares price off it correctly.
@@ -347,24 +362,46 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         _bestEffortRebalance();
     }
 
-    /// @dev Pulls `shares/supply` of every position (liquidity + fees) and of idleUSDC. Returns USDC/USDT held.
+    /**
+     * @dev Pulls `f = shares/supply` of every position plus an `f` slice of both idle counters (§8.2b).
+     *      C1 FIX: a v4 liquidity decrease settles 100% of a position's accrued fees, but the withdrawer
+     *      is entitled only to their pro-rata fee share. We snapshot each poked position's fees, pay the
+     *      withdrawer only `f·(principal+fees)`, and retain the `(1-f)·fees` surplus in the accounted idle
+     *      counters so per-share NAV stays flat for remaining holders.
+     */
     function _sliceAllPositions(uint256 shares, uint256 supply)
         internal
         returns (uint256 usdcAmt, uint256 usdtAmt)
     {
         uint256 got0;
         uint256 got1;
+        uint256 surplus0;
+        uint256 surplus1;
         for (uint8 i = 0; i < 4; i++) {
             uint128 liq = uint128(FullMath.mulDiv(positions[i].liquidity, shares, supply));
             if (liq == 0) continue;
-            (uint256 d0, uint256 d1) = _decrease(i, liq);
+            (uint256 f0, uint256 f1) = _positionFees(i); // 100% fees the decrease will settle
+            (uint256 d0, uint256 d1) = _decrease(i, liq); // f·principal + 100% fees
             got0 += d0;
             got1 += d1;
+            surplus0 += f0 - FullMath.mulDiv(f0, shares, supply); // (1-f)·fees retained
+            surplus1 += f1 - FullMath.mulDiv(f1, shares, supply);
         }
-        uint256 idleSlice = FullMath.mulDiv(idleUSDC, shares, supply);
-        idleUSDC -= idleSlice;
 
-        (usdcAmt, usdtAmt) = usdcIsToken0 ? (got0 + idleSlice, got1) : (got1 + idleSlice, got0);
+        // Slice both idle counters BEFORE retaining the new surplus (so the withdrawer doesn't slice it).
+        uint256 idleSlice0 = FullMath.mulDiv(idleUSDC, shares, supply);
+        uint256 idleSlice1 = FullMath.mulDiv(idleUSDT, shares, supply);
+        idleUSDC -= idleSlice0;
+        idleUSDT -= idleSlice1;
+
+        // Retain other holders' fee surplus in accounted idle (keeps per-share NAV flat).
+        _creditIdle(surplus0, surplus1);
+
+        // Withdrawer entitlement = (decreased tokens − retained surplus) + idle slice.
+        (uint256 payUsdc, uint256 payUsdt) =
+            usdcIsToken0 ? (got0 - surplus0, got1 - surplus1) : (got1 - surplus1, got0 - surplus0);
+        usdcAmt = payUsdc + idleSlice0;
+        usdtAmt = payUsdt + idleSlice1;
     }
 
     /// @dev Consolidate the unwanted leg into `wantToken` (§8.3), with dual-token fallback if swaps fail.
@@ -481,6 +518,7 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     function _rebalanceStep(uint8 i, int24 lower, int24 upper, uint256 valueUSDC) external {
         if (msg.sender != address(this)) revert OnlySelf();
 
+        (uint256 b0, uint256 b1) = _tokenBalances(); // for residual reconciliation (C3)
         (uint256 got0, uint256 got1) = _burnPosition(i);
 
         (uint256 amt0, uint256 amt1, uint128 liquidity) = _amountsForRange(lower, upper, valueUSDC);
@@ -492,6 +530,9 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         positions[i].lower = lower;
         positions[i].upper = upper;
         _mintInto(i, lower, upper, amt0, amt1);
+        // C3: fold leftover tokens (realised fees not redeployed, swap/rounding dust) back into accounted
+        // idle via the signed balance delta, so they stay counted in NAV instead of leaking out.
+        _reconcileIdle(b0, b1);
         emit RangeUpdated(i, lower, upper);
     }
 
@@ -534,6 +575,8 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     }
 
     /// @dev Deploy `valueUSDC` of idle USDC into position `i` over [lower,upper]: split via swap, then mint.
+    ///      Idle is debited by the ACTUAL net token outflow (signed balance delta), not the earmark, so
+    ///      swap slippage and deploy dust stay accounted in NAV instead of leaking (C3).
     function _initOne(uint8 i, int24 lower, int24 upper, uint256 valueUSDC) internal {
         if (valueUSDC == 0) return;
         (uint256 amt0, uint256 amt1, uint128 liquidity) = _amountsForRange(lower, upper, valueUSDC);
@@ -541,18 +584,14 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
 
         // We hold only USDC (idle). Provide it as the USDC leg; swap toward the target ratio.
         (uint256 have0, uint256 have1) = usdcIsToken0 ? (valueUSDC, uint256(0)) : (uint256(0), valueUSDC);
-        // Move the deployed value out of idle accounting up front; restored on swap failure.
-        idleUSDC -= valueUSDC;
+        (uint256 b0, uint256 b1) = _tokenBalances();
 
         bool ok = _swapToTarget(have0, have1, amt0, amt1);
         positions[i].lower = lower;
         positions[i].upper = upper;
-        if (!ok) {
-            // Swap venue down at init: skip deployment, return value to idle (best-effort).
-            idleUSDC += valueUSDC;
-            return;
-        }
+        if (!ok) return; // swap venue down: guard rolled back, tokens untouched, idle unchanged
         _mintInto(i, lower, upper, amt0, amt1);
+        _reconcileIdle(b0, b1); // remove net-consumed from idle; residual stays counted
         emit RangeUpdated(i, lower, upper);
     }
 
@@ -560,28 +599,34 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     // NAV helpers (§5)
     // ─────────────────────────────────────────────────────────────────────────────
 
-    /// @dev USDC value (6dp) of position `i`: principal@spot + uncollected fees. Zero if empty.
+    /// @dev USDC value (6dp) of position `i`: principal + uncollected fees, valued at `sqrtP`. Zero if empty.
     function _positionValueUSDC(uint8 i, uint160 sqrtP) internal view returns (uint256) {
         Position memory p = positions[i];
-        if (p.liquidity == 0 && p.tokenId == 0) return 0;
+        if (p.liquidity == 0) return 0;
 
-        // Principal: liquidity → token amounts at the spot price clamped into the range.
+        // Principal: liquidity → token amounts at the (NAV-clamped) price clamped into the range.
         uint160 sqrtA = TickMath.getSqrtPriceAtTick(p.lower);
         uint160 sqrtB = TickMath.getSqrtPriceAtTick(p.upper);
         uint160 sqrtClamped = sqrtP < sqrtA ? sqrtA : (sqrtP > sqrtB ? sqrtB : sqrtP);
         uint256 amt0 = SqrtPriceMath.getAmount0Delta(sqrtClamped, sqrtB, p.liquidity, false);
         uint256 amt1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtClamped, p.liquidity, false);
 
-        // Uncollected fees: feeGrowthInside delta × liquidity / Q128 (wrapping subtraction).
+        (uint256 fee0, uint256 fee1) = _positionFees(i);
+        return _valueUSDC(amt0 + fee0, amt1 + fee1, sqrtP);
+    }
+
+    /// @dev Uncollected fees (token0, token1) of position `i`: feeGrowthInside delta × liquidity / Q128
+    ///      (wrapping subtraction). Price-independent. Used by NAV and by the withdraw fee-retention (C1).
+    function _positionFees(uint8 i) internal view returns (uint256 fee0, uint256 fee1) {
+        Position memory p = positions[i];
+        if (p.liquidity == 0) return (0, 0);
         (, uint256 fg0Last, uint256 fg1Last) =
             poolManager.getPositionInfo(POOL_ID, address(positionManager), p.lower, p.upper, bytes32(p.tokenId));
         (uint256 fg0Cur, uint256 fg1Cur) = poolManager.getFeeGrowthInside(POOL_ID, p.lower, p.upper);
         unchecked {
-            amt0 += FullMath.mulDiv(fg0Cur - fg0Last, p.liquidity, Q128);
-            amt1 += FullMath.mulDiv(fg1Cur - fg1Last, p.liquidity, Q128);
+            fee0 = FullMath.mulDiv(fg0Cur - fg0Last, p.liquidity, Q128);
+            fee1 = FullMath.mulDiv(fg1Cur - fg1Last, p.liquidity, Q128);
         }
-
-        return _valueUSDC(amt0, amt1, sqrtP);
     }
 
     /// @dev Value (amt0, amt1) in USDC (6dp): USDC leg as-is + USDT leg priced at pool spot (§2).
@@ -610,14 +655,62 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Spot USDC-per-USDT in WAD, for the peg-band guard.
+    /// @dev Spot USDC-per-USDT in WAD, for the peg-band guard. Reverts cleanly on an uninitialized pool
+    ///      (sqrtP=0) so both token orderings fail identically rather than via a raw mulDiv panic.
     function _spotPriceWad(uint160 sqrtP) internal view returns (uint256) {
+        if (sqrtP == 0) revert NotInitialized();
         return _usdtToUsdc(WAD, sqrtP);
     }
 
     function _pegOk(uint160 sqrtP) internal view returns (bool) {
         uint256 p = _spotPriceWad(sqrtP);
         return p >= pegLow && p <= pegHigh;
+    }
+
+    /// @dev Spot sqrtPrice CLAMPED into the peg-band sqrt bounds — the price used for ALL NAV valuation.
+    ///      Bounds in-block spot manipulation of NAV to the band (C2). The peg CHECK still uses raw spot.
+    function _navSqrt() internal view returns (uint160 s) {
+        s = _sqrtPriceX96();
+        if (s < navSqrtLow) s = navSqrtLow;
+        else if (s > navSqrtHigh) s = navSqrtHigh;
+    }
+
+    /// @dev Recompute the NAV price-clamp band from pegLow/pegHigh (token-order aware). Called on init/setPegBand.
+    function _recomputeNavSqrtBounds() internal {
+        uint160 a = _priceWadToSqrt(pegLow);
+        uint160 b = _priceWadToSqrt(pegHigh);
+        (navSqrtLow, navSqrtHigh) = a < b ? (a, b) : (b, a);
+    }
+
+    /// @dev Pool sqrtPriceX96 whose `_spotPriceWad` equals `priceWad` (USDC-per-USDT), honouring token order.
+    ///      usdcIsToken0: pool price = 1/P ⇒ sqrt = √(WAD·2^192 / P); else pool price = P ⇒ sqrt = √(P·2^192 / WAD).
+    function _priceWadToSqrt(uint256 priceWad) internal view returns (uint160) {
+        uint256 ratio = usdcIsToken0
+            ? FullMath.mulDiv(WAD, uint256(1) << 192, priceWad)
+            : FullMath.mulDiv(priceWad, uint256(1) << 192, WAD);
+        return uint160(Math.sqrt(ratio));
+    }
+
+    /// @dev Credit token0/token1 amounts to the accounted idle counters. Donation-proof: callers pass
+    ///      DELTAS of the vault's own operations, never absolute balances.
+    function _creditIdle(uint256 amt0, uint256 amt1) internal {
+        (uint256 u, uint256 t) = usdcIsToken0 ? (amt0, amt1) : (amt1, amt0);
+        idleUSDC += u;
+        idleUSDT += t;
+    }
+
+    /// @dev Apply the signed token-balance change since (b0,b1) to the idle counters (C3 residual fold-in).
+    ///      Delta-based ⇒ donation-proof; floors at 0 so a donated token pulled into a position can't underflow.
+    function _reconcileIdle(uint256 b0, uint256 b1) internal {
+        (uint256 a0, uint256 a1) = _tokenBalances();
+        (uint256 bU, uint256 bT) = usdcIsToken0 ? (b0, b1) : (b1, b0);
+        (uint256 aU, uint256 aT) = usdcIsToken0 ? (a0, a1) : (a1, a0);
+        idleUSDC = aU >= bU ? idleUSDC + (aU - bU) : _subFloor(idleUSDC, bU - aU);
+        idleUSDT = aT >= bT ? idleUSDT + (aT - bT) : _subFloor(idleUSDT, bT - aT);
+    }
+
+    function _subFloor(uint256 x, uint256 y) internal pure returns (uint256) {
+        return x > y ? x - y : 0;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -864,6 +957,7 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     function setPegBand(uint256 _pegLow, uint256 _pegHigh) external onlyOwner {
         pegLow = _pegLow;
         pegHigh = _pegHigh;
+        _recomputeNavSqrtBounds(); // keep the NAV clamp in sync with the peg band (C2)
     }
 
     function setRiskParams(uint16 _bufferBps, uint16 _swapMaxSlippageBps, uint256 _rebalanceGasCap)
@@ -873,14 +967,6 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         bufferBps = _bufferBps;
         swapMaxSlippageBps = _swapMaxSlippageBps;
         rebalanceGasCap = _rebalanceGasCap;
-    }
-
-    function setConfidences(uint16 a, uint16 b, uint16 c) external onlyOwner {
-        confidencesBps = [a, b, c];
-    }
-
-    function setTargets(uint16 t0, uint16 t1, uint16 t2, uint16 t3) external onlyOwner {
-        targetsBps = [t0, t1, t2, t3];
     }
 
     /// @notice One-time Permit2 approvals (§10a/§13): token→Permit2 (max) and Permit2→spender for
@@ -903,14 +989,6 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
 
     function _poolKey() internal view returns (PoolKey memory) {
         return PoolKey({currency0: C0, currency1: C1, fee: POOL_FEE, tickSpacing: TICK_SPACING, hooks: HOOKS});
-    }
-
-    function poolKey() external view returns (PoolKey memory) {
-        return _poolKey();
-    }
-
-    function poolId() external view returns (PoolId) {
-        return POOL_ID;
     }
 
     function _sqrtPriceX96() internal view returns (uint160 sqrtP) {

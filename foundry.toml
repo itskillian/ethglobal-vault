@@ -7,9 +7,9 @@ solc_version = "0.8.26"
 evm_version = "cancun"
 ffi = true
 optimizer = true
-optimizer_runs = 200
-# via-IR required: keeps USDaVault runtime bytecode under the EIP-170 24,576-byte limit
-# (~23.9KB with via-IR vs ~25.8KB without). See ARCHITECTURE §11.
+# via-IR + runs=50 keep USDaVault runtime bytecode under the EIP-170 24,576-byte limit
+# (24,420 B). Raising runs improves hot-path gas but overflows the limit. See ARCHITECTURE §11.
+optimizer_runs = 50
 via_ir = true
 
 [profile.default.fuzz]
