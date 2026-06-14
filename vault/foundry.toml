@@ -1,0 +1,21 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+
+solc_version = "0.8.26"
+evm_version = "cancun"
+ffi = true
+optimizer = true
+# via-IR + runs=50 keep USDaVault runtime bytecode under the EIP-170 24,576-byte limit
+# (24,420 B). Raising runs improves hot-path gas but overflows the limit. See ARCHITECTURE §11.
+optimizer_runs = 50
+via_ir = true
+
+[profile.default.fuzz]
+runs = 256
+
+[rpc_endpoints]
+mainnet = "${ETH_RPC_URL}"
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
