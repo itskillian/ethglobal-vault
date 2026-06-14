@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 640" font-family="-apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#8b949e"/>
+    </marker>
+    <marker id="arrG" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#22c55e"/>
+    </marker>
+    <style>
+      .bg{fill:#0d1117}
+      .box{fill:#161b22;stroke:#30363d;stroke-width:1.5;rx:12}
+      .t{fill:#e6edf3;font-size:17px;font-weight:600}
+      .s{fill:#8b949e;font-size:12.5px}
+      .lbl{fill:#8b949e;font-size:12px}
+      .lblg{fill:#22c55e;font-size:12px;font-weight:600}
+      .chip{fill:#1f2430;stroke:#3a4356;stroke-width:1;rx:7}
+      .ct{fill:#c9d4e3;font-size:12px}
+      .edge{stroke:#8b949e;stroke-width:1.6;fill:none}
+      .edgeG{stroke:#22c55e;stroke-width:1.8;fill:none}
+      .title{fill:#e6edf3;font-size:22px;font-weight:700}
+      .sub{fill:#8b949e;font-size:13px}
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="980" height="640"/>
+  <text class="title" x="40" y="46">USDa Vault — how it works</text>
+  <text class="sub" x="40" y="70">Deposit USDC → market-make USDC/USDT on Uniswap v4 → fees lift the USDa share price</text>
+
+  <!-- Depositor -->
+  <rect class="box" x="40" y="150" width="160" height="92" rx="12"/>
+  <text class="t" x="120" y="190" text-anchor="middle">Depositor</text>
+  <text class="s" x="120" y="212" text-anchor="middle">holds USDa</text>
+
+  <!-- Vault -->
+  <rect class="box" x="330" y="120" width="250" height="150" rx="12"/>
+  <text class="t" x="455" y="158" text-anchor="middle">USDaVault</text>
+  <text class="s" x="455" y="180" text-anchor="middle">ERC-4626 base · custom entrypoints</text>
+  <text class="s" x="455" y="200" text-anchor="middle">NAV = positions + fees + idle</text>
+  <text class="s" x="455" y="220" text-anchor="middle">(never balanceOf → donation-proof)</text>
+  <text class="lblg" x="455" y="248" text-anchor="middle">share price = NAV / supply</text>
+
+  <!-- Hook -->
+  <rect class="box" x="330" y="430" width="250" height="92" rx="12"/>
+  <text class="t" x="455" y="468" text-anchor="middle">VaultHook</text>
+  <text class="s" x="455" y="490" text-anchor="middle">records where swaps land →</text>
+  <text class="s" x="455" y="508" text-anchor="middle">computeRanges() 90 / 99 / 99.9%</text>
+
+  <!-- Pool + positions -->
+  <rect class="box" x="690" y="110" width="250" height="200" rx="12"/>
+  <text class="t" x="815" y="146" text-anchor="middle">Uniswap v4</text>
+  <text class="s" x="815" y="166" text-anchor="middle">USDC / USDT pool</text>
+  <rect class="chip" x="710" y="184" width="210" height="26" rx="7"/>
+  <text class="ct" x="718" y="202">P0 · full-range backstop</text>
+  <rect class="chip" x="710" y="216" width="210" height="26" rx="7"/>
+  <text class="ct" x="718" y="234">P1 · 90% band (most capital)</text>
+  <rect class="chip" x="710" y="248" width="210" height="26" rx="7"/>
+  <text class="ct" x="718" y="266">P2 · 99% band</text>
+  <rect class="chip" x="710" y="280" width="210" height="26" rx="7"/>
+  <text class="ct" x="718" y="298">P3 · 99.9% band</text>
+
+  <!-- Off-pool swap -->
+  <rect class="box" x="690" y="430" width="250" height="92" rx="12"/>
+  <text class="t" x="815" y="464" text-anchor="middle">Off-pool swap venue</text>
+  <text class="s" x="815" y="486" text-anchor="middle">separate deep pool + backup</text>
+  <text class="s" x="815" y="504" text-anchor="middle">two-sided guard: can only fail</text>
+
+  <!-- edges -->
+  <!-- depositor -> vault deposit -->
+  <path class="edge" d="M200,178 L326,160" marker-end="url(#arr)"/>
+  <text class="lbl" x="218" y="160">deposit USDC</text>
+  <!-- vault -> depositor mint / withdraw -->
+  <path class="edgeG" d="M330,232 L204,214" marker-end="url(#arrG)"/>
+  <text class="lblg" x="40" y="268">↩ mint / redeem USDa</text>
+
+  <!-- vault -> pool provide liquidity -->
+  <path class="edge" d="M580,165 L686,170" marker-end="url(#arr)"/>
+  <text class="lbl" x="588" y="158">provide liquidity</text>
+  <!-- pool -> vault fees -->
+  <path class="edgeG" d="M686,205 L582,205" marker-end="url(#arrG)"/>
+  <text class="lblg" x="590" y="224">LP fees → NAV ↑</text>
+
+  <!-- hook -> vault -->
+  <path class="edge" d="M455,428 L455,272" marker-end="url(#arr)"/>
+  <text class="lbl" x="465" y="360">bands tell the vault</text>
+  <text class="lbl" x="465" y="376">where to concentrate</text>
+
+  <!-- pool -> hook (afterSwap) -->
+  <path class="edge" d="M730,310 Q610,400 582,452" marker-end="url(#arr)"/>
+  <text class="lbl" x="612" y="372">afterSwap</text>
+
+  <!-- vault <-> off-pool -->
+  <path class="edge" d="M560,270 Q650,360 700,426" marker-end="url(#arr)"/>
+  <text class="lbl" x="600" y="330">rebalance swaps</text>
+  <text class="lbl" x="600" y="346">(never its own pool)</text>
+
+  <text class="s" x="40" y="600">Withdraw in USDC or USDT (depeg valve) · self-rebalancing each deposit/withdraw · oracle-free price clamped to the peg band</text>
+</svg>

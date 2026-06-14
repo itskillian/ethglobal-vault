@@ -17,5 +17,10 @@ runs = 256
 
 [rpc_endpoints]
 mainnet = "${ETH_RPC_URL}"
+sepolia = "${SEPOLIA_RPC_URL}"
+
+# Source verification on deploy (`--verify`). Etherscan v2 uses a single multichain key.
+[etherscan]
+sepolia = { key = "${ETHERSCAN_API_KEY}", chain = 11155111 }
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

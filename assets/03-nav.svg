@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 600" font-family="-apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="ad" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#f59e0b"/>
+    </marker>
+    <style>
+      .bg{fill:#0d1117}
+      .title{fill:#e6edf3;font-size:22px;font-weight:700}
+      .sub{fill:#8b949e;font-size:13px}
+      .ax{stroke:#30363d;stroke-width:1.5}
+      .grid{stroke:#222831;stroke-width:1}
+      .axt{fill:#8b949e;font-size:12.5px}
+      .nav{fill:none;stroke:#22c55e;stroke-width:3}
+      .usdc{fill:none;stroke:#8b949e;stroke-width:1.6;stroke-dasharray:6 5}
+      .amb{fill:#f59e0b;font-size:12.5px;font-weight:600}
+      .navt{fill:#22c55e;font-size:13px;font-weight:600}
+      .note{fill:#c9d4e3;font-size:12.5px}
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="980" height="600"/>
+  <text class="title" x="40" y="46">USDa appreciates as fees accrue — and donations can't move it</text>
+  <text class="sub" x="40" y="70">Share price = NAV / supply, computed from positions + earned fees + tracked idle only (never token.balanceOf)</text>
+
+  <!-- gridlines + y labels -->
+  <line class="grid" x1="120" y1="440" x2="900" y2="440"/>
+  <line class="grid" x1="120" y1="376" x2="900" y2="376"/>
+  <line class="grid" x1="120" y1="312" x2="900" y2="312"/>
+  <line class="grid" x1="120" y1="248" x2="900" y2="248"/>
+  <line class="grid" x1="120" y1="184" x2="900" y2="184"/>
+  <text class="axt" x="112" y="444" text-anchor="end">1.00</text>
+  <text class="axt" x="112" y="380" text-anchor="end">1.02</text>
+  <text class="axt" x="112" y="316" text-anchor="end">1.04</text>
+  <text class="axt" x="112" y="252" text-anchor="end">1.06</text>
+  <text class="axt" x="112" y="188" text-anchor="end">1.08</text>
+  <text class="axt" x="72" y="300" text-anchor="middle" transform="rotate(-90 72 300)">USDC per USDa share</text>
+
+  <!-- area under NAV -->
+  <path d="M120,440 C300,420 380,390 500,355 C620,320 760,255 900,205 L900,440 L120,440 Z" fill="#22c55e" opacity="0.10"/>
+
+  <!-- USDC reference -->
+  <line class="usdc" x1="120" y1="440" x2="900" y2="440"/>
+  <text class="axt" x="876" y="432" text-anchor="end" fill="#8b949e">USDC = 1.00</text>
+
+  <!-- NAV curve -->
+  <path class="nav" d="M120,440 C300,420 380,390 500,355 C620,320 760,255 900,205"/>
+  <text class="navt" x="300" y="402">trading fees compound into NAV</text>
+
+  <!-- donation event -->
+  <line x1="560" y1="170" x2="560" y2="332" stroke="#f59e0b" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#ad)"/>
+  <circle cx="560" cy="340" r="4.5" fill="#22c55e"/>
+  <text class="amb" x="568" y="162">someone transfers tokens straight to the vault…</text>
+  <text class="amb" x="568" y="182">…NAV ignores it — no jump, no kink</text>
+
+  <!-- x axis -->
+  <line class="ax" x1="120" y1="440" x2="900" y2="440"/>
+  <text class="axt" x="510" y="478" text-anchor="middle">time  →  (each deposit/withdraw also triggers a best-effort rebalance)</text>
+
+  <text class="note" x="40" y="558">This closes the classic ERC-4626 inflation/donation attack: only LP fees the vault actually earns raise the price.</text>
+</svg>
