@@ -9,6 +9,7 @@ out/
 
 # Docs
 docs/
+DISTRIBUTION_HOOK_ARCHITECTURE.md
 
 # Dotenv file
 .env
