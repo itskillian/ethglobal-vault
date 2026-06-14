@@ -32,7 +32,10 @@ contract USDaVaultForkTest is Test {
     address constant UNIVERSAL_ROUTER = 0x4C82D1fBFe28C977cBB58D8C7FF8FCF9F70a2cCA;
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
+    uint160 constant Q96 = 79228162514264337593543950336; // price 1.0
+
     USDaVault vault;
+    PoolKey vaultKey;
     address user = address(0xBEEF);
     address owner = address(0xA11CE);
     bool forked;
@@ -44,9 +47,13 @@ contract USDaVaultForkTest is Test {
         forked = true;
 
         // Vault pool: USDC/USDT, no hook (rebalance's hook call is try/caught → degrades to "hold").
-        PoolKey memory vaultKey = _key(USDC, USDT, 100, 1, address(0));
+        vaultKey = _key(USDC, USDT, 100, 1, address(0));
         // Primary swap pool: a different USDC/USDT pool id (different fee/spacing).
         PoolKey memory swapKey = _key(USDC, USDT, 500, 10, address(0));
+
+        // Initialize the vault pool at peg so totalAssets()/the deposit peg guard read a valid spot price.
+        // (A fresh pool id is uninitialized on-fork; sqrtP=0 would div-by-zero the peg check.)
+        try IPoolManager(POOL_MANAGER).initialize(vaultKey, Q96) {} catch {}
 
         vault = new USDaVault(
             IERC20(USDC),
@@ -141,4 +148,39 @@ contract USDaVaultForkTest is Test {
         assertEq(IERC20(USDC).balanceOf(user), out, "user received USDC");
         assertApproxEqAbs(vault.totalAssets(), amt - out, 1e3, "NAV reduced by payout");
     }
+
+    /// @dev C2 regression: a vault whose pool spot is off peg must REJECT deposits (mint-cheap defense).
+    function test_deposit_revertsOffPeg() public {
+        if (!forked) return;
+        // Distinct USDC/USDT pool initialized ~+2% in sqrt → price ~0.96 USDC/USDT, below pegLow (0.995).
+        PoolKey memory offKey = _key(USDC, USDT, 3000, 60, address(0));
+        uint160 sqrtOff = uint160((uint256(Q96) * 1020) / 1000);
+        try IPoolManager(POOL_MANAGER).initialize(offKey, sqrtOff) {} catch {}
+
+        USDaVault offVault = new USDaVault(
+            IERC20(USDC),
+            IERC20(USDT),
+            IPoolManager(POOL_MANAGER),
+            IPositionManager(POSITION_MANAGER),
+            IUniversalRouter(UNIVERSAL_ROUTER),
+            offKey,
+            _key(USDC, USDT, 500, 10, address(0)),
+            address(0),
+            owner
+        );
+
+        deal(USDC, user, 1_000e6);
+        vm.startPrank(user);
+        IERC20(USDC).approve(address(offVault), 1_000e6);
+        vm.expectRevert(USDaVault.OffPeg.selector);
+        offVault.deposit(1_000e6, 0, block.timestamp);
+        vm.stopPrank();
+    }
+
+    // NOTE: full C1 (pro-rata fee retention) and C3 (deploy-residual fold-in) regression requires the
+    // position lifecycle — initialize() opening 4 positions, real swaps accruing fees, then a small
+    // withdraw — which additionally needs the vault pool to carry the VaultHook and a seeded primary swap
+    // pool. Wire those in (deploy hook at a flagged address, seed liquidity) to assert: after a tiny
+    // withdraw, per-share NAV (totalAssets/totalSupply) is unchanged for remaining holders. The accounting
+    // backbone for both fixes is unit-tested in USDaVaultUnit.t.sol (creditIdle/reconcileIdle, NAV clamp).
 }

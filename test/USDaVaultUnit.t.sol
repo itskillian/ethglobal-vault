@@ -109,6 +109,84 @@ contract USDaVaultUnitTest is Test {
         assertApproxEqRel(vUsdc0 * vUsdt0, 1e12, 1e15); // within 0.1% relative
     }
 
+    // ── C2: NAV price-clamp band ────────────────────────────────────────
+
+    function test_navBand_edgesMapToPegPrices_bothOrderings() public view {
+        // Valuing 1 USDT at each band edge must yield exactly the peg-band prices (0.995 / 1.005), and
+        // the two edges must be the two bounds — in both token orderings.
+        for (uint256 k = 0; k < 2; k++) {
+            USDaVaultHarness v = k == 0 ? vaultUsdc0 : vaultUsdt0;
+            (uint160 lo, uint160 hi) = v.navBand();
+            assertLt(lo, hi, "band ordered");
+            uint256 atLo = v.exp_navValueOfUsdt(1e18, lo);
+            uint256 atHi = v.exp_navValueOfUsdt(1e18, hi);
+            uint256 min_ = atLo < atHi ? atLo : atHi;
+            uint256 max_ = atLo < atHi ? atHi : atLo;
+            assertApproxEqRel(min_, 0.995e18, 1e15, "low edge ~ pegLow"); // 0.1% tol
+            assertApproxEqRel(max_, 1.005e18, 1e15, "high edge ~ pegHigh");
+        }
+    }
+
+    /// @dev Core C2 property: NAV's USDT-leg valuation cannot be pushed beyond the peg band no matter how
+    ///      far spot is manipulated, in BOTH token orderings.
+    function test_navClamp_boundsUsdtValuationUnderManipulation() public view {
+        // Push spot way down and way up; the clamped valuation of 1e18 USDT must stay within [0.995,1.005].
+        uint160 wayDown = uint160(uint256(Q96) / 2); // price far below peg
+        uint160 wayUp = uint160(uint256(Q96) * 2); // price far above peg
+        for (uint256 k = 0; k < 2; k++) {
+            USDaVaultHarness v = k == 0 ? vaultUsdc0 : vaultUsdt0;
+            uint256 vd = v.exp_navValueOfUsdt(1e18, wayDown);
+            uint256 vu = v.exp_navValueOfUsdt(1e18, wayUp);
+            assertGe(vd, 0.995e18 - 1e12, "clamped low >= pegLow");
+            assertLe(vd, 1.005e18 + 1e12, "clamped low <= pegHigh");
+            assertGe(vu, 0.995e18 - 1e12, "clamped high >= pegLow");
+            assertLe(vu, 1.005e18 + 1e12, "clamped high <= pegHigh");
+        }
+    }
+
+    function test_navClamp_passesThroughInsideBand() public view {
+        // At exactly peg, the clamp is a no-op and valuation is 1:1.
+        assertApproxEqAbs(vaultUsdc0.exp_navValueOfUsdt(1e18, Q96), 1e18, 1e9);
+        assertApproxEqAbs(vaultUsdt0.exp_navValueOfUsdt(1e18, Q96), 1e18, 1e9);
+    }
+
+    // ── C3: dual-token idle accounting backbone ─────────────────────────
+
+    function test_creditIdle_mapsByTokenOrdering() public {
+        // usdc0: token0=USDC, token1=USDT → credit(amt0,amt1) adds amt0 to idleUSDC, amt1 to idleUSDT.
+        vaultUsdc0.exp_creditIdle(100, 7);
+        assertEq(vaultUsdc0.idleUSDC(), 100, "usdc0 idleUSDC");
+        assertEq(vaultUsdc0.idleUSDT(), 7, "usdc0 idleUSDT");
+        // usdt0: token0=USDT, token1=USDC → mapping flips.
+        vaultUsdt0.exp_creditIdle(100, 7);
+        assertEq(vaultUsdt0.idleUSDC(), 7, "usdt0 idleUSDC");
+        assertEq(vaultUsdt0.idleUSDT(), 100, "usdt0 idleUSDT");
+    }
+
+    /// @dev _reconcileIdle applies the SIGNED balance delta since (b0,b1) to the idle counters — this is
+    ///      what folds deploy residuals back into NAV (C3). Donation-proof because it uses deltas only.
+    function test_reconcileIdle_appliesSignedDelta() public {
+        // Seed harness token balances: 1000 USDC (token0), 400 USDT (token1).
+        usdc.mint(address(vaultUsdc0), 1000);
+        usdt.mint(address(vaultUsdc0), 400);
+        // Pretend before-balances were (1200, 300): USDC dropped 200 (consumed), USDT rose 100 (gained).
+        vaultUsdc0.exp_reconcileIdle(1200, 300);
+        // idleUSDC -= 200 (floored at 0 since it was 0) → 0; idleUSDT += 100 → 100.
+        assertEq(vaultUsdc0.idleUSDC(), 0, "usdc floored (consumed > prior idle)");
+        assertEq(vaultUsdc0.idleUSDT(), 100, "usdt gained credited");
+    }
+
+    function test_reconcileIdle_creditsResidualGain() public {
+        // Pre-seed idle via creditIdle, then reconcile a net gain on both legs.
+        vaultUsdc0.exp_creditIdle(500, 500); // idleUSDC=500, idleUSDT=500
+        usdc.mint(address(vaultUsdc0), 600);
+        usdt.mint(address(vaultUsdc0), 600);
+        // before-balances (100,100): both rose by 500 → credit 500 each.
+        vaultUsdc0.exp_reconcileIdle(100, 100);
+        assertEq(vaultUsdc0.idleUSDC(), 1000, "idleUSDC += 500");
+        assertEq(vaultUsdc0.idleUSDT(), 1000, "idleUSDT += 500");
+    }
+
     // ── peg guard (§9.2) ────────────────────────────────────────────────
 
     function test_pegOk_true_atPeg() public view {

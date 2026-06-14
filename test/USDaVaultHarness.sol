@@ -45,4 +45,34 @@ contract USDaVaultHarness is USDaVault {
     function exp_align(int24 ticks) external view returns (int24) {
         return _align(ticks);
     }
+
+    function exp_priceWadToSqrt(uint256 priceWad) external view returns (uint160) {
+        return _priceWadToSqrt(priceWad);
+    }
+
+    function navBand() external view returns (uint160 lo, uint160 hi) {
+        return (navSqrtLow, navSqrtHigh);
+    }
+
+    /// @dev The C2 clamp applied to an arbitrary input sqrt (mirrors _navSqrt without reading the pool).
+    function exp_clampToNavBand(uint160 s) external view returns (uint160) {
+        if (s < navSqrtLow) return navSqrtLow;
+        if (s > navSqrtHigh) return navSqrtHigh;
+        return s;
+    }
+
+    /// @dev USDT→USDC valuation at the clamped input price — the value NAV would assign the USDT leg.
+    function exp_navValueOfUsdt(uint256 usdtAmt, uint160 spotSqrt) external view returns (uint256) {
+        uint160 s = spotSqrt < navSqrtLow ? navSqrtLow : (spotSqrt > navSqrtHigh ? navSqrtHigh : spotSqrt);
+        return _usdtToUsdc(usdtAmt, s);
+    }
+
+    // C3 idle-accounting backbone (no pool read; _reconcileIdle reads token balanceOf):
+    function exp_creditIdle(uint256 amt0, uint256 amt1) external {
+        _creditIdle(amt0, amt1);
+    }
+
+    function exp_reconcileIdle(uint256 b0, uint256 b1) external {
+        _reconcileIdle(b0, b1);
+    }
 }
