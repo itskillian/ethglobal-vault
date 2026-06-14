@@ -1,7 +1,7 @@
 # Distribution Hook — Architecture & Implementation Brief
 
-> Spec for the distribution-hook codebase. Read top-to-bottom before laying out contracts.
-> This is the full design; build to it.
+> Spec for the distribution-hook codebase, kept in sync with `src/vaultHook.sol`.
+> Read top-to-bottom before touching the contract.
 
 ---
 
@@ -24,7 +24,12 @@ Key facts:
 - The three positions are three **confidence bands** derived from a **single** decayed
   distribution. The exponential decay **half-life** (default 30 days, configurable per pool)
   *is* the lookback window — there is no multi-timeframe machinery.
-- Base contracts: v4 `BaseHook` + OpenZeppelin `Ownable` (the owner gates the manual rebase).
+- Only swaps landing inside a **capture window** (~±5% around the peg, per-pool) are recorded;
+  out-of-range / MEV outliers are ignored (Section 2).
+- Pools **self-maintain**: a permissionless `poke` renormalises and prunes on a cadence
+  (default weekly), so neither a keeper nor the owner is needed for routine upkeep (Section 5).
+- Base contracts: v4 `BaseHook` + OpenZeppelin `Ownable`. The owner only tunes config and can
+  *force* a rebase; routine rebase/prune is permissionless.
 
 **Not in this codebase (the vault, a separate component):** ERC20 credit shares, single-token
 zap/auto-swap, repositioning, NAV. The hook just exposes the ranges; the vault consumes them.
@@ -33,24 +38,30 @@ zap/auto-swap, repositioning, NAV. The hook just exposes the ranges; the vault c
 
 ## 1. State (per pool)
 
-Sparse histogram using Uniswap's tick-bitmap pattern, plus a decay clock and config.
+Sparse histogram using Uniswap's tick-bitmap pattern, plus a decay clock and per-pool config.
 
 ```solidity
 struct PoolDist {
     // --- histogram (sparse; bitmap gives sorted iteration) ---
     mapping(int16 => uint256) bitmap;   // 1 bit per COMPRESSED tick = "has weight"
     mapping(int24 => uint256) weight;   // decay-inflated weight per COMPRESSED tick (WAD)
-    int24  minTick;                     // lowest compressed tick ever touched (scan lower bound)
-    int24  maxTick;                     // highest compressed tick ever touched (scan upper bound)
+    int24   minTick;                    // lowest compressed tick with weight (scan lower bound)
+    int24   maxTick;                    // highest compressed tick with weight (scan upper bound)
 
     // --- decay clock ---
-    uint32 t0;                          // epoch start; reference for the growth factor & rebase
+    uint32  t0;                         // epoch start; reference for the growth factor & rebase
 
     // --- config ---
-    uint32 halfLife;                    // seconds (default 30 days)
-    uint8  weighting;                   // 0 = count (default), 1 = volume
-    int24  tickSpacing;                 // cached from PoolKey at init
-    bool   initialized;
+    uint32  halfLife;                   // seconds (default 30 days)
+    uint8   weighting;                  // 0 = count (default), 1 = volume; locked after first weight
+    int24   tickSpacing;                // cached from PoolKey at init
+    int24   captureLowerTick;           // compressed; swaps landing below are ignored
+    int24   captureUpperTick;           // compressed; swaps landing above are ignored
+    uint32  rebaseInterval;             // seconds between auto-rebases via poke() (default 7 days)
+    bool    initialized;
+    bool    started;                    // set on first recorded weight; locks `weighting`
+    uint256 minData;                    // sufficiency floor, decay-normalised WAD (default 3e18)
+    uint256 pruneFraction;              // rebase prunes ticks < total/pruneFraction; 0 = disabled
 }
 
 mapping(PoolId => PoolDist) internal pools;
@@ -64,13 +75,17 @@ mapping(PoolId => PoolDist) internal pools;
 - One bitmap + one weight mapping handles both the dense core (price's usual band = a few
   full words) and rare outliers (a depeg spike = one lone set bit far away) — no special-
   casing of common vs rare ticks.
+- The config fields (`halfLife`, `weighting`, `minData`, `captureLowerTick`/`captureUpperTick`,
+  `rebaseInterval`, `pruneFraction`) are seeded with defaults at `afterInitialize` and are
+  **per-pool, owner-tunable** (Section 6). `weighting` is the exception: it locks once
+  `started` flips, because mixing count and volume units would corrupt the histogram.
 
 ---
 
 ## 2. Capture — `afterSwap` (the swap-path hot path)
 
 On each swap, increment the **landing tick** (post-swap current tick) by an amount scaled by
-the current growth factor. O(1).
+the current growth factor — but only if the landing tick is inside the capture window. O(1).
 
 ```
 afterSwap(sender, key, params, delta, hookData) -> (bytes4, int128):
@@ -80,29 +95,49 @@ afterSwap(sender, key, params, delta, hookData) -> (bytes4, int128):
     (, int24 tick, , ) = poolManager.getSlot0(poolId)     // StateLibrary; post-swap landing tick
     int24 c = compress(tick, P.tickSpacing)               // floor division — handle negatives!
 
-    uint256 g      = growthFactor(P)                       // exp(λ·(now−t0)), WAD, clamped (Section 3)
-    uint256 amount = (P.weighting == COUNT) ? WAD : volumeOf(delta)   // WAD-scaled
+    // Capture window: ignore swaps landing outside [captureLowerTick, captureUpperTick].
+    if (c < P.captureLowerTick || c > P.captureUpperTick)
+        return (IHooks.afterSwap.selector, 0)             // out of range / MEV — not recorded
+
+    uint256 g         = growthFactor(P)                   // exp(λ·(now−t0)), WAD, clamped (Section 3)
+    uint256 amount    = (P.weighting == COUNT) ? WAD : volumeOf(delta)   // WAD-scaled
+    uint256 increment = fullMulDiv(amount, g, WAD)        // 512-bit intermediate; saturated g can't revert
+    if (increment == 0) return (IHooks.afterSwap.selector, 0)   // zero-volume swap records nothing
 
     uint256 w = P.weight[c]
-    if (w == 0) {                                          // first time this tick has weight
-        flipBit(P.bitmap, c)                              // set bitmap bit
+    if (w == 0) {                                         // first time this tick has weight
+        flipBit(P.bitmap, c)                             // set bitmap bit
         if (c < P.minTick) P.minTick = c
         if (c > P.maxTick) P.maxTick = c
     }
-    P.weight[c] = w + amount * g / WAD
+    P.weight[c] = w + increment
+    if (!P.started) P.started = true
 
-    return (IHooks.afterSwap.selector, 0)                  // no delta adjustment
+    return (IHooks.afterSwap.selector, 0)                 // no delta adjustment
 ```
 
 - **Landing tick = post-swap tick** (`getSlot0` in `afterSwap`). This is count/volume
-  weighting of *where swaps land*, not time-in-tick weighting. Every swap counts, including
-  multiple swaps in the same block.
+  weighting of *where swaps land*, not time-in-tick weighting. Every captured swap counts,
+  including multiple swaps in the same block.
 - `compress` must floor toward negative infinity (Uniswap does:
   `compressed = tick / spacing; if (tick < 0 && tick % spacing != 0) compressed--`).
 - **Count weighting (default):** `amount = WAD` (1.0 per swap).
-- **Volume weighting (optional, via `weighting` flag):** `volumeOf(delta)` picks one
-  consistent measure — e.g. `abs(amount0)` or the input amount — scaled to WAD-comparable
-  units. Volume overflows the growth factor sooner (Section 5), so count is the default.
+- **Volume weighting (optional, via `weighting` flag):** `volumeOf(delta) = abs(amount0)`,
+  scaled to WAD-comparable units. Volume overflows the growth factor sooner (Section 5), so
+  count is the default. The increment uses `fullMulDiv` so even a saturated `g` cannot revert.
+
+**Capture window.** Seeded at `afterInitialize` to `compress(initialTick ± CAPTURE_HALF_WIDTH)`
+— ~±500 ticks ≈ ±5% in price (≈ 0.951–1.051) around the init (peg) tick — and owner-tunable
+via `setCaptureWindow`. Its purpose is twofold:
+- **Reject noise:** a one-off MEV sandwich or a far out-of-range swap never enters the
+  distribution, so the bands reflect where price *actually trades*.
+- **Bound the scan:** `minTick`/`maxTick` can only widen within the window, capping the number
+  of words `computeRanges` and `rebase` walk (the cost the vault pays at mint/burn).
+
+The trade-off: a genuine repeg beyond the window is not recorded until the owner widens it.
+For a stable-pegged vault that's the intended behaviour; the owner moves the window on a real
+repeg. Out-of-window weight recorded *before* a window tightening is left in place — the window
+only stops the range widening further.
 
 ---
 
@@ -148,7 +183,8 @@ growthFactor(P):
 ```
 
 - `halfLife` is per-pool config (default 30 days). Changing it live must be done via a rebase
-  + epoch reset (takes effect going forward), so treat it as set-once-tune-rarely.
+  + epoch reset (takes effect going forward), so treat it as set-once-tune-rarely. `setConfig`
+  does this for you (it rebases at the old half-life first).
 - `expWad` reverts once its input exceeds ~135 (≈ `g = 10⁵⁸`). The clamp guarantees swaps
   never revert even if a rebase is overdue — decay simply "saturates" until the next rebase.
 
@@ -160,115 +196,176 @@ Walks the bitmap once and extracts the percentile bands. Lives in the hook (it o
 layout). The vault calls it at mint/burn; the vault user pays the SLOADs.
 
 ```
-computeRanges(poolId, uint16[] confidencesBps) view returns (Range[] memory):
+computeRanges(poolId, uint16[] confidencesBps) view returns (Range[] ranges, bool ok):
     P = pools[poolId]
+    validate every confidence <= 10000 (else revert InvalidConfidence)
+    if (!P.initialized) return (zeroed, false)
 
     // 1. Walk bitmap words from word(minTick) .. word(maxTick).
-    //    For each set bit (ascending = sorted), SLOAD weight[c], push (c, w) to memory.
-    //    Accumulate `total` in the same pass.  Use Kernighan bit-clear (bits &= bits-1)
+    //    For each set bit (ascending = sorted), SLOAD weight[c], collect (c, w).
+    //    Accumulate `total` in the same pass. Kernighan bit-clear (bits &= bits-1)
     //    + leastSignificantBit (BitMath) to iterate set bits within a word.
+    if (no set bits) return (zeroed, false)
 
-    // 2. If total < MIN_DATA (or bitmap empty) -> return a sentinel.
-    //    The vault must NOT reposition on this; it holds positions / uses a safe wide default.
+    // 2. Sufficiency gate (decay-normalised). An ABSOLUTE threshold does NOT cancel `g`, so
+    //    compare against MIN_DATA scaled up to the current epoch:
+    if (total < minData * g / WAD) return (zeroed, false)   // ok = false
 
     // 3. For each confidence c (bps): tail = (10000 - c) / 2.
-    //      lowerThreshold = total * tail        / 10000
-    //      upperThreshold = total * (10000-tail)/ 10000
+    //      lowerThreshold = total * tail         / 10000
+    //      upperThreshold = total * (10000-tail) / 10000
     //    (90% -> 5% / 95%;  99% -> 0.5% / 99.5%;  99.9% -> 0.05% / 99.95%)
 
     // 4. Single ascending pass over the in-memory (c, w) array, running cum += w,
     //    recording the compressed tick as cum crosses each threshold (lower & upper for
-    //    every confidence). All boundaries captured in one sweep; inner while-loop handles
-    //    one fat tick crossing several thresholds at once.
+    //    every confidence). One fat tick can cross several thresholds at once.
 
-    // 5. Decompress (× tickSpacing), align to tickSpacing, return [lowerTick, upperTick]
-    //    per confidence.
+    // 5. Decompress (× tickSpacing, already aligned). Guarantee a non-degenerate range
+    //    (upper = lower + spacing if they collapse). Return [lowerTick, upperTick] per
+    //    confidence, and ok = true.
 ```
 
 The vault passes `[9000, 9900, 9990]` and gets back three `[lowerTick, upperTick]` ranges =
-its three positions. The decay factor never appears here — ratios cancel it. Confidence levels
-are a parameter so the vault can tune them without a hook redeploy.
+its three positions, plus `ok`. **Confidence** here means "the tightest tick band that contains
+that fraction of decay-weighted swap activity" (a 90% band trims the lightest 5% from each
+tail) — not a ±5% offset from the extremes. The decay factor never appears in the band ratios
+(Section 3); it appears *only* in the sufficiency gate of step 2, because an absolute floor
+doesn't cancel.
+
+- **`ok == false`** when the pool is uninitialised, has no recorded weight, or has too little
+  (decay-normalised) data. The vault must **not** reposition on this — it holds its positions
+  or uses a safe wide default. `ranges` is zeroed in that case.
+- **`minData`** is per-pool config in decay-normalised WAD. For count weighting it reads as
+  "effective recent swaps", so the default `3e18 ≈ 3 recent swaps` — deliberately low so a
+  freshly-seeded pool produces ranges almost immediately (a hackathon convenience; the vault
+  seeds the pool's initial liquidity range itself). Tune via `setConfig`.
 
 ---
 
-## 5. Rebase — owner-only, manual
+## 5. Rebase & prune — owner force + permissionless `poke`
 
-`g` grows forever. Two ceilings, both far away: `expWad` reverts ~16 years out (30d
-half-life), and uint256 accumulation is orders of magnitude beyond that. A **rebase**
-renormalises so neither is ever hit.
+`g` grows forever. Two ceilings, both far away: `expWad` reverts ~16 years out (30d half-life),
+and uint256 accumulation is well beyond that. A **rebase** renormalises so neither is hit — and
+while it's walking every tick anyway, it **prunes** ones that have decayed to dust and
+re-tightens the scan bounds.
 
 ```
-rebase(poolId):   // onlyOwner
-    P = pools[poolId]
-    R = growthFactor(P)                          // current g (WAD)
+_rebase(P):
+    R = growthFactor(P)                               // current g (WAD)
+
+    // Pass 1: renormalise every weight by R, sum the new total.
+    newTotal = 0
     walk bitmap minTick..maxTick:
-        P.weight[c] = P.weight[c] * WAD / R      // divide every weight by the same R
-    P.t0 = block.timestamp                        // reset epoch -> g back to 1
+        P.weight[c] = P.weight[c] * WAD / R           // same R for all -> ratios unchanged
+        newTotal   += P.weight[c]
+
+    // Pass 2: prune dust and re-tighten [minTick, maxTick] to the survivors.
+    dust = (P.pruneFraction == 0) ? 0 : newTotal / P.pruneFraction
+    walk bitmap minTick..maxTick:
+        if (P.weight[c] <= dust):
+            clear bitmap bit; delete P.weight[c]      // free the slot (gas refund)
+        else:
+            extend newMin/newMax to c
+    P.minTick, P.maxTick = newMin, newMax (if any survived)
+    P.t0 = block.timestamp                            // g back to 1
 ```
 
-- Dividing **every** weight by the same `R` changes **no ratios**, so all percentiles are
-  identical pre/post rebase. Integer-division rounding is negligible and monotonic.
-- After reset, old (rebased) weights act as the baseline that future inflated increments
-  outgrow at the same rate — decay continues seamlessly.
-- Cadence: with a 30-day half-life, rebasing roughly every 1–2 years caps `g` at ~10⁷,
-  leaving ~50 orders of magnitude of headroom under both ceilings. It is a rare maintenance
-  call, not an operational burden.
+- **Renormalise:** dividing **every** weight by the same `R` changes **no ratios**, so all
+  percentiles are identical pre/post. Integer-division rounding is sub-wei.
+- **Prune:** a tick holding `< total / pruneFraction` is decayed to negligible; dropping it
+  keeps reads walking only the live band and reclaims storage. `pruneFraction` is per-pool
+  config (default `1e4` ⇒ dust = 0.01% of total). That's comfortably below the tightest band's
+  tail (99.9% trims 0.05% per side = `total/2000`), so pruning never clips a live band; the
+  `MIN_PRUNE_FRACTION = 2000` floor caps the most-aggressive setting at exactly that tail
+  granularity, and `0` disables pruning entirely (a tick that rounded to zero weight is still
+  dropped). How fast a tick reaches the dust threshold is governed by the **half-life**, not
+  the rebase cadence.
+
+Two entry points:
+
+```
+poke(poolId):                  // permissionless
+    if (P.initialized && block.timestamp - P.t0 >= P.rebaseInterval) _rebase(P)
+
+rebase(poolId):                // onlyOwner — force one now
+    _rebase(P)
+```
+
+- **`poke`** is the routine path: anyone may call it, and the vault calls it at mint/burn, so
+  pools self-maintain with **no keeper** and **swappers never pay for a rebase**. It's a cheap
+  no-op until `rebaseInterval` has elapsed.
+- **Cadence:** `rebaseInterval` defaults to **7 days** (weekly) and is owner-tunable in
+  `[1 day, 365 days]` via `setRebaseInterval`. Frequent rebasing keeps `g` near 1 and clears
+  stray/MEV ticks promptly, instead of letting them linger for years. It is cheap relative to
+  the percentile read that triggers it.
 - The `MAX_EXP` clamp (Section 3) is the backstop that makes an overdue rebase safe — swaps
-  never revert.
-- (A later optimisation could fold the rebase into `computeRanges` at mint/burn when
-  `now − t0` exceeds a bound — that read already iterates every tick, so the marginal cost is
-  one SSTORE per tick with no keeper. Not required to ship.)
+  never revert even if `poke` is never called.
 
 ---
 
 ## 6. Config & access control
 
-- OpenZeppelin `Ownable`.
-- Owner-only: `rebase(poolId)`, `setConfig(poolId, halfLife, weighting)` (and any per-pool
-  params). Bound `halfLife` to a sane range.
-- Per-pool config is set at `afterInitialize` (defaults) and adjustable by the owner.
+- OpenZeppelin `Ownable`; defaults are seeded per-pool at `afterInitialize`.
+- **Owner-only setters** (each bounds its input and reverts on a bad value):
+  - `setConfig(poolId, halfLife, weighting, minData)` — rebases at the **old** half-life first
+    so the new one takes effect cleanly. `weighting` may only change while the pool is unstarted
+    (`WeightingLocked` otherwise). `halfLife ∈ [1d, 365d]`, `minData ∈ [1e18, 1e30]`.
+  - `setCaptureWindow(poolId, lowerTick, upperTick)` — raw ticks; requires `lower < upper`.
+  - `setRebaseInterval(poolId, interval)` — `interval ∈ [1d, 365d]`.
+  - `setPruneFraction(poolId, fraction)` — `fraction == 0` (disabled) or `>= 2000`.
+  - `rebase(poolId)` — force an immediate rebase + prune.
+- **Permissionless:** `poke(poolId)` — interval-gated rebase; the only state-changing call open
+  to anyone (and a no-op before the interval elapses).
+- **Views:** `poolConfig`, `captureWindow`, `rebaseConfig` (interval + pruneFraction),
+  `growthFactor`, `weightAt` — for the vault and observability.
 
 ---
 
 ## 7. Hook permissions (v4 flags)
 
-- `afterInitialize = true` — cache `tickSpacing`, set `t0 = block.timestamp`, seed
-  `minTick = maxTick = compress(initialTick)`, set `initialized`, apply default config.
+- `afterInitialize = true` — cache `tickSpacing`, set `t0 = block.timestamp`, apply default
+  config (`halfLife`, `weighting`, `minData`, `rebaseInterval`, `pruneFraction`), seed the
+  capture window to `compress(initialTick ± CAPTURE_HALF_WIDTH)`, seed
+  `minTick = maxTick = compress(initialTick)`, set `initialized`.
 - `afterSwap = true` — the capture path.
 - `afterSwapReturnDelta = false` — returns 0 delta.
-- All other callbacks `false`.
+- All other callbacks `false`. (Permission-flag address bits: `afterInitialize | afterSwap`.)
 
 ---
 
 ## 8. Edge cases & guardrails
 
-- **Cold pool init:** seed `minTick`/`maxTick`/`t0` in `afterInitialize` so the first swap
-  doesn't compare against zero-initialised bounds.
-- **Negative ticks:** `compress` must floor toward −∞ (see Section 2). Signed arithmetic
+- **Cold pool init:** seed `minTick`/`maxTick`/`t0`/config in `afterInitialize` so the first
+  swap doesn't compare against zero-initialised bounds. No bitmap bit is set until the first
+  captured swap.
+- **Capture window:** swaps landing outside `[captureLowerTick, captureUpperTick]` are dropped
+  (Section 2) — this is the primary guard against MEV/out-of-range data and the bound on read
+  cost. Widen it (owner) only on a genuine repeg.
+- **Negative ticks:** `compress` floors toward −∞ (see Section 2). Signed arithmetic
   throughout; `minTick`/`maxTick` are signed.
-- **Insufficient data:** `computeRanges` returns a sentinel when `total < MIN_DATA` or the
-  bitmap is empty. The vault treats this as "don't reposition" (hold current positions or use
-  a safe wide default) — never compute ranges off near-empty data.
-- **Long idle pool:** if no swaps for a very long time, the `MAX_EXP` clamp keeps the next
-  swap from reverting; data is just stale until activity/rebase resume.
-- **Same-block swaps:** all counted (count/volume weighting).
-- **Read cost grows with distinct touched ticks.** For a stablepool it plateaus at the band
-  width. Far outliers leave set bits in place; pruning bits whose rebased weight rounds to ~0
-  during rebase is an optional cleanup.
+- **Insufficient data:** `computeRanges` returns `ok = false` when `total < minData·g/WAD`, the
+  bitmap is empty, or the pool is uninitialised. The vault treats this as "don't reposition".
+- **Long idle pool:** if no swaps for a very long time, the `MAX_EXP` clamp keeps the next swap
+  from reverting; data is just stale until activity/`poke`/rebase resume.
+- **Same-block swaps:** all counted (count/volume weighting), provided they land in-window.
+- **Read cost grows with distinct touched ticks** but is capped by the capture window and kept
+  tight by pruning at each rebase (no longer an optional cleanup — it runs every `_rebase`).
 - **Volume weighting** (if used) overflows sooner than count and needs a defined, scaled
-  measure ⇒ rebase more often.
-- **Intermediate overflow:** `amount * g` before `/ WAD` is fine under uint256 for realistic
-  values; keep an eye on it for volume + a very large `g` (i.e. overdue rebase).
+  measure ⇒ shorten `rebaseInterval`. `fullMulDiv` keeps the `amount·g` product from reverting
+  even when `g` is saturated.
 
 ---
 
 ## 9. Gas profile (ballpark, mainnet rules)
 
-- **Per swap:** +~5–9k (read config/`t0`, one `expWad`, read+write `weight[c]`). One-time
-  ~+20k the first time a brand-new tick is touched (new slot + bitmap bit).
+- **Per swap (captured):** +~5–9k (read config/`t0`, one `expWad`, read+write `weight[c]`).
+  One-time ~+20k the first time a brand-new in-window tick is touched (new slot + bitmap bit).
+  **Out-of-window swap:** just the `getSlot0` + compare, then early return — near-free.
 - **`computeRanges` (view, paid inside vault mint/burn):** O(touched ticks) SLOADs ≈
-  ~250–650k for a stablepool.
-- **`rebase`:** like a read but with an SSTORE per tick; ~once every 1–2 years.
+  ~250–650k for a stablepool — bounded by the capture window.
+- **`rebase` / `poke`:** like a read but with an SSTORE per surviving tick and slot-clears
+  (refunds) for pruned ones; folded into vault mint/burn via `poke` on the `rebaseInterval`
+  cadence (default weekly), so there's no keeper and swappers never pay for it.
 
 The expensive percentile work sits on mint/burn (vault users), keeping the swap path cheap —
 that's the whole point of the inflate-on-write design.
@@ -277,11 +374,16 @@ that's the whole point of the inflate-on-write design.
 
 ## 10. Defaults summary
 
-- Weighting: **count** (`weighting = 0`); volume available via flag.
-- Half-life: **30 days**, per-pool configurable.
+- Weighting: **count** (`weighting = 0`); volume available via flag, locked once data exists.
+- Half-life: **30 days**, per-pool configurable (`[1d, 365d]`).
 - Confidence bands: **90% / 99% / 99.9%**, passed as a `computeRanges` parameter.
-- `computeRanges` lives in the **hook**, returns raw ticks.
-- `MIN_DATA`: a configurable minimum total weight below which `computeRanges` returns a
-  sentinel.
+- Capture window: **~±5%** (`CAPTURE_HALF_WIDTH = 500` ticks) around the peg, per-pool
+  configurable via `setCaptureWindow`.
+- `computeRanges` lives in the **hook**, returns raw ticks plus an `ok` flag.
+- `minData`: sufficiency floor in decay-normalised WAD, **default `3e18`** (~3 effective recent
+  swaps), per-pool configurable (`[1e18, 1e30]`); deliberately low for fast hackathon activation.
+- Rebase cadence (`rebaseInterval`): **7 days**, per-pool configurable (`[1d, 365d]`); routine
+  rebase/prune is permissionless via `poke`, owner can force via `rebase`.
+- `pruneFraction`: **default `1e4`** (dust = 0.01% of total), per-pool configurable; `>= 2000`
+  or `0` to disable.
 - `MAX_EXP`: clamp (~100·WAD) on the decay exponent so `expWad` never reverts.
-- Rebase: manual, owner-only.
