@@ -10,6 +10,7 @@ out/
 # Docs
 docs/
 AUDIT.md
+ARCHITECTURE.md
 
 # Dotenv file
 .env

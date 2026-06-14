@@ -10,6 +10,7 @@ out/
 # Docs
 docs/
 DISTRIBUTION_HOOK_ARCHITECTURE.md
+DEPLOY.md
 
 # Dotenv file
 .env
