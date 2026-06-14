@@ -113,18 +113,16 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
 
     /// @dev Hook confidence bands for positions 1–3 (e.g. [9000, 9900, 9990]).
     uint16[3] public confidencesBps;
-    /// @dev NAV-allocation targets per position at (re)deploy, bps. Must sum to BPS when bufferBps==0.
+    /// @dev NAV-allocation targets per position at (re)deploy, bps. Sum to BPS (all idle invested).
     uint16[4] public targetsBps;
 
     uint256 public rebalanceBand; // drift (ticks) that marks a position for rebalance
-    uint256 public reentryBand; // hysteresis: re-mark only after drift returns below this
     uint256 public minWidth; // min hook-band width (ticks) accepted
     uint256 public maxWidth; // max hook-band width (ticks) accepted
 
     uint256 public pegLow; // peg band lower bound, USDC-per-USDT in WAD (e.g. 0.995e18)
     uint256 public pegHigh; // peg band upper bound, USDC-per-USDT in WAD (e.g. 1.005e18)
 
-    uint16 public bufferBps; // idle USDC reserve kept out of positions (0 = invest all)
     uint16 public swapMaxSlippageBps; // bounds minOut on internal swaps (e.g. 30)
     uint256 public rebalanceGasCap; // inline rebalance skipped if gasleft() < this
 
@@ -179,6 +177,7 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
     error VanillaEntrypointDisabled();
     error AmountTooLarge();
     error OffPeg();
+    error InitDeployFailed();
 
     // ─────────────────────────────────────────────────────────────────────────────
     // Constructor (§11)
@@ -224,12 +223,10 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         confidencesBps = [uint16(9000), 9900, 9990];
         targetsBps = [uint16(100), 7900, 1500, 500]; // 1% / 79% / 15% / 5% = 100%
         rebalanceBand = 50;
-        reentryBand = 25;
         minWidth = uint256(uint24(vaultPoolKey.tickSpacing)); // ≥ one spacing
         maxWidth = 200_000;
         pegLow = 0.995e18;
         pegHigh = 1.005e18;
-        bufferBps = 0;
         swapMaxSlippageBps = 30;
         rebalanceGasCap = 350_000;
 
@@ -551,6 +548,10 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         if (idleUSDC == 0) revert ZeroAmount();
         initialized = true;
 
+        // C7: set Permit2 approvals here so position deploys can settle/swap — no separate approveAll()
+        // prerequisite, so a forgotten approval can't silently open zero positions.
+        _approveAll();
+
         // Dead shares (§6): minted to an unredeemable address, backed by the seed.
         _mint(DEAD, MINIMUM_LIQUIDITY);
 
@@ -569,6 +570,13 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
             int24 lo = _clampTick(cur - halfWidth[j]);
             int24 hi = _clampTick(cur + halfWidth[j]);
             _initOne(i, lo, hi, FullMath.mulDiv(nav, targetsBps[i], BPS));
+        }
+
+        // C7: require every position actually opened. If a deploy swap couldn't fill (swap venue not
+        // seeded / misconfigured), revert the WHOLE tx — restoring idleUSDC and the one-shot flag — so
+        // the owner can fix the venue and retry, instead of bricking the vault with empty positions.
+        for (uint8 i = 0; i < 4; i++) {
+            if (positions[i].liquidity == 0) revert InitDeployFailed();
         }
 
         emit Initialized(MINIMUM_LIQUIDITY, seeded);
@@ -944,14 +952,10 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         emit SwapVenueUpdated(_swapPoolKey, _backupRouter);
     }
 
-    function setBands(uint256 _rebalanceBand, uint256 _reentryBand, uint256 _minWidth, uint256 _maxWidth)
-        external
-        onlyOwner
-    {
+    /// @dev `rebalanceBand` is the only band tuned in practice; the others keep their constructor
+    ///      defaults for the MVP. (Drift/width bands were a 4-param `setBands` setter, dropped for size.)
+    function setRebalanceBand(uint256 _rebalanceBand) external onlyOwner {
         rebalanceBand = _rebalanceBand;
-        reentryBand = _reentryBand;
-        minWidth = _minWidth;
-        maxWidth = _maxWidth;
     }
 
     function setPegBand(uint256 _pegLow, uint256 _pegHigh) external onlyOwner {
@@ -960,18 +964,21 @@ contract USDaVault is ERC4626, Ownable, ReentrancyGuard {
         _recomputeNavSqrtBounds(); // keep the NAV clamp in sync with the peg band (C2)
     }
 
-    function setRiskParams(uint16 _bufferBps, uint16 _swapMaxSlippageBps, uint256 _rebalanceGasCap)
-        external
-        onlyOwner
-    {
-        bufferBps = _bufferBps;
+    function setRiskParams(uint16 _swapMaxSlippageBps, uint256 _rebalanceGasCap) external onlyOwner {
+        if (_swapMaxSlippageBps > BPS) revert AmountTooLarge(); // C9: prevent _minOut underflow DoS
         swapMaxSlippageBps = _swapMaxSlippageBps;
         rebalanceGasCap = _rebalanceGasCap;
     }
 
     /// @notice One-time Permit2 approvals (§10a/§13): token→Permit2 (max) and Permit2→spender for
     ///         {PositionManager, UniversalRouter}, for both USDC and USDT. Owner-callable, idempotent.
+    ///         Also called automatically by initialize() (C7), so a manual call is only needed to
+    ///         re-approve (e.g. after rotating a swap venue).
     function approveAll() external onlyOwner {
+        _approveAll();
+    }
+
+    function _approveAll() internal {
         _approveViaPermit2(USDC, address(positionManager));
         _approveViaPermit2(USDC, address(universalRouter));
         _approveViaPermit2(USDT, address(positionManager));
