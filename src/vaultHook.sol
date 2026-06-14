@@ -413,17 +413,19 @@ contract VaultHook is BaseHook, Ownable {
 
         // Pass 2: prune negligible (decayed) ticks and re-tighten [minTick, maxTick] to the survivors.
         // pruneFraction == 0 disables pruning (dust = 0 still drops any tick that rounded to zero weight).
-        uint256 dust = P.pruneFraction == 0 ? 0 : newTotal / P.pruneFraction;
+        uint256 pf = P.pruneFraction; // cache: read once instead of twice across the ternary
+        uint256 dust = pf == 0 ? 0 : newTotal / pf;
         int24 newMin = type(int24).max;
         int24 newMax = type(int24).min;
         bool any;
         for (int16 word = minWord;; word++) {
             uint256 bits = P.bitmap[word];
+            uint256 clear; // bits to drop from this word; coalesced into one RMW after the inner loop
             while (bits != 0) {
                 uint8 lsb = BitMath.leastSignificantBit(bits);
                 int24 c = int24(word) * 256 + int24(uint24(lsb));
                 if (P.weight[c] <= dust) {
-                    P.bitmap[word] &= ~(uint256(1) << lsb); // drop the bit
+                    clear |= uint256(1) << lsb; // defer the drop (clears are commutative)
                     delete P.weight[c]; // free the slot (gas refund)
                 } else {
                     if (c < newMin) newMin = c;
@@ -432,6 +434,8 @@ contract VaultHook is BaseHook, Ownable {
                 }
                 bits &= bits - 1;
             }
+            // Apply all of this word's drops at once: one SLOAD+SSTORE per word, not per pruned bit.
+            if (clear != 0) P.bitmap[word] &= ~clear;
             if (word == maxWord) break;
         }
         if (any) {
