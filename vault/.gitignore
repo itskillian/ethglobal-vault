@@ -9,6 +9,7 @@ out/
 
 # Docs
 docs/
+AUDIT.md
 
 # Dotenv file
 .env
